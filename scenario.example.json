@@ -1,0 +1,14 @@
+{
+  "consumers": [
+    {
+      "type": "heat_pump_simple",
+      "name": "waermepumpe",
+      "base_kw": 3.0,
+      "day_factor": 1.25,
+      "night_factor": 0.75,
+      "day_start_hour": 6,
+      "day_end_hour": 22,
+      "weekend_factor": 1.1
+    }
+  ]
+}
