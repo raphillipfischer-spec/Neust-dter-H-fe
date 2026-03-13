@@ -13,6 +13,7 @@ from typing import Dict, List, Sequence, Tuple
 from xml.sax.saxutils import escape
 
 DateValue = Tuple[datetime, float]
+EXPECTED_STEP_MINUTES = 15
 
 
 @dataclass
@@ -44,57 +45,16 @@ def read_csv_timeseries(path: Path, time_col: str, value_col: str) -> List[DateV
     return out
 
 
-def floor_to_interval(dt: datetime, minutes: int) -> datetime:
-    discard = timedelta(minutes=dt.minute % minutes, seconds=dt.second, microseconds=dt.microsecond)
-    return dt - discard
-
-
-def resample(series: List[DateValue], target_minutes: int, method: str) -> List[DateValue]:
-    if not series:
-        return []
-    method = method.lower()
-
-    if method in {"mean", "sum"}:
-        buckets: Dict[datetime, List[float]] = {}
-        for dt, val in series:
-            k = floor_to_interval(dt, target_minutes)
-            buckets.setdefault(k, []).append(val)
-        out: List[DateValue] = []
-        for k in sorted(buckets.keys()):
-            vals = buckets[k]
-            out.append((k, sum(vals) if method == "sum" else (sum(vals) / len(vals))))
-        return out
-
-    if method == "interpolate":
-        start = floor_to_interval(series[0][0], target_minutes)
-        end = floor_to_interval(series[-1][0], target_minutes)
-        src_t = [x[0] for x in series]
-        src_v = [x[1] for x in series]
-
-        def interp(target: datetime) -> float:
-            if target <= src_t[0]:
-                return src_v[0]
-            if target >= src_t[-1]:
-                return src_v[-1]
-            for i in range(1, len(src_t)):
-                if src_t[i] >= target:
-                    t0, t1 = src_t[i - 1], src_t[i]
-                    v0, v1 = src_v[i - 1], src_v[i]
-                    span = (t1 - t0).total_seconds()
-                    if span == 0:
-                        return v1
-                    ratio = (target - t0).total_seconds() / span
-                    return v0 + (v1 - v0) * ratio
-            return src_v[-1]
-
-        out: List[DateValue] = []
-        t = start
-        while t <= end:
-            out.append((t, interp(t)))
-            t += timedelta(minutes=target_minutes)
-        return out
-
-    raise ValueError("Unbekannte Methode. Erlaubt: mean, sum, interpolate")
+def validate_15min_series(series: Sequence[DateValue], series_name: str) -> None:
+    if len(series) < 2:
+        return
+    expected = timedelta(minutes=EXPECTED_STEP_MINUTES)
+    for i in range(1, len(series)):
+        step = series[i][0] - series[i - 1][0]
+        if step != expected:
+            raise ValueError(
+                f"{series_name} ist nicht im 15-Minuten-Raster. Fehler bei {series[i - 1][0]} -> {series[i][0]} ({step})."
+            )
 
 
 def adjust_percent(series: List[DateValue], percent: float) -> List[DateValue]:
@@ -132,7 +92,7 @@ def load_scenario(path: Path) -> Dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def build_consumer(cfg: Dict, target_index: Sequence[datetime], target_minutes: int) -> ConsumerResult:
+def build_consumer(cfg: Dict, target_index: Sequence[datetime]) -> ConsumerResult:
     ctype = cfg.get("type")
     name = cfg.get("name", ctype or "consumer")
 
@@ -153,17 +113,12 @@ def build_consumer(cfg: Dict, target_index: Sequence[datetime], target_minutes: 
 
     if ctype == "profile_file":
         s = read_csv_timeseries(Path(cfg["path"]), cfg.get("time_col", "timestamp"), cfg.get("value_col", "load_kw"))
-        s = resample(s, target_minutes, cfg.get("resample_method", "mean"))
+        validate_15min_series(s, f"Profil '{name}'")
         s = align_series(s, target_index)
         scale = float(cfg.get("scale", 1.0))
         return ConsumerResult(name=name, series=[(t, v * scale) for t, v in s])
 
     raise ValueError(f"Unbekannter Verbrauchertyp: {ctype}")
-
-
-def excel_serial(dt: datetime) -> float:
-    epoch = datetime(1899, 12, 30)
-    return (dt - epoch).total_seconds() / 86400.0
 
 
 def sheet_xml(headers: List[str], rows: List[List[object]]) -> str:
@@ -233,39 +188,29 @@ def write_xlsx(path: Path, sheets: List[Tuple[str, List[str], List[List[object]]
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Lastgänge anpassen und als Excel ausgeben")
-    p.add_argument("--input", required=True, help="CSV-Eingabe")
+    p = argparse.ArgumentParser(description="Lastgänge (nur 15-Minuten-Werte) anpassen und als Excel ausgeben")
+    p.add_argument("--input", required=True, help="CSV-Eingabe mit 15-Minuten-Werten")
     p.add_argument("--output", required=True, help="XLSX-Ausgabe")
     p.add_argument("--time-col", default="timestamp")
     p.add_argument("--value-col", default="load_kw")
-    p.add_argument("--target-freq", default="15min")
-    p.add_argument("--resample-method", default="mean", choices=["mean", "sum", "interpolate"])
     p.add_argument("--increase-percent", type=float, default=0.0)
     p.add_argument("--scenario", default=None, help="Optionale JSON-Szenario-Datei")
     return p.parse_args()
 
 
-def freq_to_minutes(freq: str) -> int:
-    f = freq.strip().lower()
-    if not f.endswith("min"):
-        raise ValueError("Nur Frequenzen im Format '<zahl>min' unterstützt, z. B. 15min")
-    return int(f[:-3])
-
-
 def main() -> None:
     args = parse_args()
-    target_minutes = freq_to_minutes(args.target_freq)
 
     base = read_csv_timeseries(Path(args.input), args.time_col, args.value_col)
-    base_rs = resample(base, target_minutes, args.resample_method)
-    base_adj = adjust_percent(base_rs, args.increase_percent)
+    validate_15min_series(base, "Basis-Lastgang")
+    base_adj = adjust_percent(base, args.increase_percent)
 
     target_idx = [t for t, _ in base_adj]
     consumers: List[ConsumerResult] = []
     if args.scenario:
         sc = load_scenario(Path(args.scenario))
         for c in sc.get("consumers", []):
-            consumers.append(build_consumer(c, target_idx, target_minutes))
+            consumers.append(build_consumer(c, target_idx))
 
     total_map = {t: v for t, v in base_adj}
     for c in consumers:
